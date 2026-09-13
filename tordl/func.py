@@ -18,8 +18,9 @@ from tordl.rpc import JsonRpcServer, JsonRpcClient
 def _mk_loop(loop):
     if not loop:
         core.mk_loop()
-        loop = asyncio.get_event_loop()
-
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
     return loop
 
 
