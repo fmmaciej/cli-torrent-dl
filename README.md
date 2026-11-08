@@ -1,6 +1,9 @@
 tordl
 =====
 
+This fork is maintained for srtor. See [FORK.md](FORK.md) for the small patch set,
+packaging changes, and offline verification instructions.
+
 <img src="./img/tordl.gif" width="732">
 
 About

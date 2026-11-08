@@ -1,6 +1,8 @@
 include requirements.txt
 include README.md
 include LICENSE.md
+include FORK.md
+recursive-include tests *.py
 include tordl.py
 include tordl.sh
 include setup.sh
