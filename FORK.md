@@ -13,12 +13,20 @@ The upstream project is
 - Discover the actual `tordl` package at the repository root. Upstream's
   `find_packages(where='tordl')` produced a wheel containing metadata alone.
 - Declare the setuptools build backend and Python 3.12 minimum. The patched
-  distribution version is `1.10.post1`.
+  distribution version is `1.10.post2`.
 - Keep only direct runtime dependencies in `requirements.txt`: aiohttp,
   Beautiful Soup, pyxdg, pyperclip, and uvloop on supported Unix platforms.
   Remove obsolete transitive/publishing pins. The aiohttp lower bound excludes
   upstream's yanked 3.11.14 release.
 - Add offline regression checks against the installed wheel.
+- Retain per-engine `search_errors` and `magnet_errors` on `DlFacade`, so one
+  provider's exception does not discard other results. HTTP error statuses and
+  request timeouts are recorded; parser exceptions escaping engine code are
+  identified separately. `successful_engines` also tracks valid empty responses,
+  including searches where another page fails.
+- Cancel and await owned search/magnet tasks when a caller's deadline expires.
+  A failed missing-magnet lookup returns `None` with diagnostics rather than
+  leaving the batch waiting indefinitely.
 
 Retain upstream authorship and the MIT license. Keep subsequent changes small,
 documented, and suitable for contributing upstream. This fork does not add a
@@ -30,7 +38,7 @@ From the fork checkout, with uv available:
 
 ```sh
 uv build --python 3.12
-uv run --no-project --python 3.12 --with dist/tordl-1.10.post1-py3-none-any.whl \
+uv run --no-project --python 3.12 --with dist/tordl-1.10.post2-py3-none-any.whl \
   python -m unittest discover -s tests -v
 ```
 
@@ -49,6 +57,10 @@ Import `tordl.config` before `tordl.core` to avoid the existing circular import.
 For helper/UI imports, load `config` and then `func` first, as upstream's launcher
 does; importing `app` before `func` encounters another existing import cycle.
 The `Api` constructor does not correctly forward custom engine classes; direct
-`DlFacade(loop=..., dl_classes=...)` remains the clearer boundary. Existing
-scraper behavior and error reporting have not been rewritten. No live provider
+`DlFacade(loop=..., dl_classes=...)` remains the clearer boundary. Provider-specific
+scraper code has not been rewritten. No live provider
 health claim is made by these offline tests.
+Some legacy engine parsers still swallow their own exceptions and return an empty
+list. The facade cannot recover those hidden failures; repair them with
+provider-specific fixtures rather than treating a live empty response as proof
+that a scraper works.

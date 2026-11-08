@@ -98,6 +98,7 @@ class BaseDl(object):
         self._current_index = 1
         self._current_search = None
         self._headers = self._create_headers()
+        self.last_error = None
 
     async def search(self, expression):
         if expression is None:
@@ -116,7 +117,13 @@ class BaseDl(object):
             self._mk_search_url(self._current_search)
         )
 
-        return self._process_search(response) if response else None
+        if not response:
+            return None
+        try:
+            return self._process_search(response)
+        except Exception as exc:
+            self.last_error = ('parser', str(exc) or type(exc).__name__)
+            raise
 
     async def get_magnet_url(self, search_result):
         self._set_referer(self._mk_search_url(self._current_search))
@@ -126,6 +133,7 @@ class BaseDl(object):
         return await self._process_magnet_link(response) if response else None
 
     async def _get_url(self, url):
+        self.last_error = None
         try:
             async with ClientSession(
                     headers=self._headers,
@@ -134,16 +142,19 @@ class BaseDl(object):
                 async with sess.get(
                         url, timeout=cfg.REQUEST_TIMEOUT
                 ) as response:
+                    response.raise_for_status()
                     return await response.read()
         except asyncio.exceptions.TimeoutError:
+            self.last_error = ('network', 'request timed out')
             return None
-        except Exception:
+        except Exception as exc:
             # This should handle "aiohttp.client_exceptions.
             # ClientConnectionError", SSL Errors, ConnectionResetError and
             # basically all kind of errors happening on an HTTP connection. Some
             # Torrent Sites we scrape might close a connection due to too many
             # requests and so on. It's better to just die silently than break
             # the ncurses window and basically 'break' the whole app.
+            self.last_error = ('network', str(exc) or type(exc).__name__)
             return None
 
     def _mk_search_url(self, expression):
@@ -227,6 +238,9 @@ class DlFacade(object):
         self._ml_fetch_tasks = None
 
         self._last_exclude = None
+        self.search_errors = {}
+        self.magnet_errors = {}
+        self.successful_engines = set()
 
     @property
     def engines(self):
@@ -250,7 +264,7 @@ class DlFacade(object):
 
         coros = []
         for dl in self._engines.values():
-            coros.append(dl.search(expression))
+            coros.append(self._search_engine(dl, expression))
 
         if search_progress and search_progress.max_ == 1:
             search_progress.max_ = len(self._engines.items())
@@ -278,7 +292,33 @@ class DlFacade(object):
 
         return result
 
+    def _record_error(self, errors, engine, stage, error):
+        previous = getattr(engine, 'last_error', None)
+        if previous:
+            stage, message = previous
+        else:
+            message = str(error) or type(error).__name__
+        errors[engine.NAME] = '%s: %s' % (stage, message)
+
+    async def _search_engine(self, engine, expression):
+        engine.last_error = None
+        try:
+            result = await engine.search(expression)
+        except Exception as exc:
+            self._record_error(self.search_errors, engine, 'search', exc)
+            return []
+        if result is None:
+            self._record_error(
+                self.search_errors, engine, 'search', 'search returned no response'
+            )
+            return []
+        self.successful_engines.add(engine.NAME)
+        return result
+
     async def fetch_pages(self, search_term, search_progress=None):
+        self.search_errors.clear()
+        self.magnet_errors.clear()
+        self.successful_engines.clear()
         coros = []
         if search_progress:
             search_progress.max_ = \
@@ -319,7 +359,17 @@ class DlFacade(object):
 
     async def get_magnet_url(self, search_result):
         e = self._engines[search_result.origins[0]]
-        return await e.get_magnet_url(search_result)
+        e.last_error = None
+        try:
+            magnet = await e.get_magnet_url(search_result)
+        except Exception as exc:
+            self._record_error(self.magnet_errors, e, 'magnet', exc)
+            return None
+        if not magnet:
+            self._record_error(
+                self.magnet_errors, e, 'magnet', 'magnet link not found'
+            )
+        return magnet
 
     async def fetch_magnet_links(
             self, search_results, concurrent=20, search_progress=None
@@ -335,23 +385,33 @@ class DlFacade(object):
             if not sr.magnet_url:
                 self._no_magnet_links.append(sr)
 
-        ln = len(self._no_magnet_links)
-        if ln > 0:
-            if search_progress:
-                search_progress.max_ = ln
-            max_ = min(concurrent, ln)
-            self._ml_fetch_counter = max_ - 1
-            for i in range(0, max_):
-                sr = self._no_magnet_links[i]
-                self._create_ml_fetch_task(sr, search_progress)
+        try:
+            ln = len(self._no_magnet_links)
+            if ln > 0:
+                if search_progress:
+                    search_progress.max_ = ln
+                max_ = min(concurrent, ln)
+                self._ml_fetch_counter = max_ - 1
+                for i in range(0, max_):
+                    sr = self._no_magnet_links[i]
+                    self._create_ml_fetch_task(sr, search_progress)
 
-            await self._mls_fetched.wait()
-
-        self._no_magnet_links = None
+                await self._mls_fetched.wait()
+        finally:
+            tasks = list(self._ml_fetch_tasks)
+            for task in tasks:
+                task.remove_done_callback(self._on_fetch_magnet_done)
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._ml_fetch_tasks = []
+            self._no_magnet_links = None
 
         return search_results
 
     def _on_fetch_magnet_done(self, task):
+        if task.cancelled() or self._no_magnet_links is None:
+            return
         task.search_result.magnet_url = task.result()
         task.remove_done_callback(self._on_fetch_magnet_done)
         self._ml_fetch_tasks.remove(task)
@@ -408,22 +468,29 @@ class DlFacade(object):
 
     @staticmethod
     async def _wait_with_progress(coros, search_progress=None):
-        done, pending = await asyncio.wait(
-            [asyncio.create_task(cor) for cor in coros], return_when=FIRST_COMPLETED
-        )
-        done = list(done)
-        if search_progress:
-            search_progress.progress += len(done)
-
-        while pending:
-            done_, pending = await asyncio.wait(
-                pending, return_when=FIRST_COMPLETED
+        tasks = [asyncio.create_task(cor) for cor in coros]
+        try:
+            done, pending = await asyncio.wait(
+                tasks, return_when=FIRST_COMPLETED
             )
-            done.extend(done_)
+            done = list(done)
             if search_progress:
-                search_progress.progress += len(done_)
+                search_progress.progress += len(done)
 
-        return done
+            while pending:
+                done_, pending = await asyncio.wait(
+                    pending, return_when=FIRST_COMPLETED
+                )
+                done.extend(done_)
+                if search_progress:
+                    search_progress.progress += len(done_)
+
+            return done
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class SearchEngineTest(object):
